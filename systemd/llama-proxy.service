@@ -1,0 +1,30 @@
+[Unit]
+Description=llama.cpp recording/replay proxy for tests
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ineersa/projects/llama-proxy
+Environment=LLAMA_PROXY_UPSTREAM=http://127.0.0.1:8052
+Environment=LLAMA_PROXY_HOST=0.0.0.0
+Environment=LLAMA_PROXY_PORT=9052
+Environment=LLAMA_PROXY_CACHE_DIR=/var/cache/llama-proxy
+Environment=LLAMA_PROXY_REPLAY_TPS=1000
+# Optional: require X-Llama-Proxy-Token on cache admin endpoints.
+# Environment=LLAMA_PROXY_ADMIN_TOKEN=change-me
+# Requires: cd WorkingDirectory && uv sync  (creates .venv from uv.lock)
+ExecStart=/home/ineersa/projects/llama-proxy/.venv/bin/python -m llama_proxy
+Restart=always
+RestartSec=5
+
+MemoryAccounting=yes
+MemoryHigh=512M
+MemoryMax=1G
+OOMPolicy=stop
+
+TimeoutStopSec=30
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
