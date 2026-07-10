@@ -67,6 +67,8 @@ If `LLAMA_PROXY_ADMIN_TOKEN` is set, cache admin endpoints require:
 | `LLAMA_PROXY_REQUEST_TIMEOUT_S` | `600` | upstream timeout; `0`/`none` disables |
 | `LLAMA_PROXY_ADMIN_TOKEN` | unset | optional admin endpoint token |
 | `LLAMA_PROXY_CACHE_NORMALIZE_MESSAGES` | `true` | when enabled, cache key ignores volatile chat prologue (see below); set `false` for full-body keys |
+| `LLAMA_PROXY_CACHE_TEMPLATE_ARTIFACT_IDS` | `true` | when enabled, normalize `agent_[0-9a-f]{16}` ids in cache keys and cassettes (see below); set `false` to store/replay raw ids |
+| `LLAMA_PROXY_CACHE_TEMPLATE_OUTPUT_CAP_PATHS` | `true` | when enabled, normalize Hatfield output-cap `Saved full output:` paths in cache keys and cassettes (see below); set `false` for raw paths |
 
 ## Cache key
 
@@ -88,6 +90,34 @@ Upstream requests on a cache miss still use the **full original** body. Recorded
 Non-JSON bodies and JSON without `messages` are keyed on the full parsed body (or raw body hash) as before.
 
 That means changing model parameters, tools, or `stream` still produces a new key; volatile system prompts and `[user-context]` prologue usually do not, once the tail of the conversation matches a prior recording.
+
+### Agent artifact ids
+
+When `LLAMA_PROXY_CACHE_TEMPLATE_ARTIFACT_IDS` is enabled (default), the proxy treats volatile subagent artifact ids as templated values:
+
+- **Cache key:** every `agent_[0-9a-f]{16}` in JSON string values is replaced with `{{agent_artifact_id}}` in the key material (after message prologue normalization). Additional **key-only** normalization (upstream body unchanged): `parent_run_id` / `agent_run_id` labels and JSON fields, `/var/tmp/test-subagent-retrieve-*` paths, `Current working directory: …` for those paths, and `Artifact ID: agent_…` labels.
+- **Current id:** extracted from the request JSON by scanning string fields; if a string contains `Artifact:`, the first matching id after that label wins; otherwise the first id in document order.
+- **Record:** successful responses are stored with ids templated to `{{agent_artifact_id}}`. Non-stream JSON tool-call `arguments` are templated in parsed form. **Streaming SSE:** the proxy parses `data:` events, accumulates `delta.tool_calls[].function.arguments` (and legacy `function_call.arguments`) per choice/index, templates the assembled JSON strings, and rewrites the last delta for each tool call so ids split across events (e.g. `agen` + `t_<hex>`) are still normalized. Cached replay may use different chunk boundaries; SSE remains valid.
+- **Replay:** `{{agent_artifact_id}}` in stored bodies is replaced with the current request’s extracted id. Replay may emit one streaming chunk instead of the original chunk boundaries; SSE content stays valid.
+
+Upstream requests on a cache miss still use the **full original** body (real ids). Disable with `LLAMA_PROXY_CACHE_TEMPLATE_ARTIFACT_IDS=false` to revert to raw id keys and stored responses.
+
+Ephemeral check (not pytest): `scripts/sse_artifact_smoke.py` spins up a fake upstream and proxy on free ports.
+
+Clear the cache after changing this setting or upgrading, since older cassettes may lack placeholders or use different key material.
+
+### Output-cap saved paths
+
+When `LLAMA_PROXY_CACHE_TEMPLATE_OUTPUT_CAP_PATHS` is enabled (default), paths introduced by the model-facing line `Saved full output: <path>` are treated as volatile:
+
+- **Extraction:** scan all JSON string values; for each line containing `Saved full output:`, capture the remainder of the line (trimmed) as a path. Deduplicate by first appearance. Unrelated absolute paths without that marker are not normalized.
+- **Cache key:** after message/artifact/dynamic-field normalization, replace every exact occurrence of each extracted path in JSON string values with indexed placeholders `{{output_cap_path_0}}`, `{{output_cap_path_1}}`, … (same index for repeated references to the same path).
+- **Record:** successful responses are stored with those paths templated to the same placeholders (JSON bodies, tool-call `arguments`, and streaming SSE via assembled tool-argument buffers plus a final pass over the SSE bytes so paths split across chunks are still normalized).
+- **Replay:** placeholders are replaced with the current request’s extracted paths in order. If a cached response needs a placeholder index the current request cannot supply, the cassette is treated as unusable and the proxy falls through to an upstream miss (no stale path and no unresolved placeholder is returned).
+
+Upstream requests on a cache miss still use the **full original** body. Clear the cache after changing this setting.
+
+Ephemeral check (not pytest): `scripts/output_cap_smoke.py`.
 
 ## systemd
 

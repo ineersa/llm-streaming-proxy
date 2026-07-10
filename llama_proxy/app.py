@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -44,6 +45,27 @@ DEFAULT_CACHE_PATHS = {
 }
 
 USER_CONTEXT_PREFIX = "[user-context] "
+AGENT_ARTIFACT_ID_RE = re.compile(r"\bagent_[0-9a-f]{16}\b")
+AGENT_ARTIFACT_PLACEHOLDER = "{{agent_artifact_id}}"
+ARTIFACT_LABEL = "Artifact:"
+PARENT_RUN_ID_LABEL_RE = re.compile(r"parent_run_id:\s*[A-Za-z0-9_-]+")
+PARENT_RUN_ID_JSON_RE = re.compile(r'"parent_run_id"\s*:\s*"[^"]+"')
+AGENT_RUN_ID_LABEL_RE = re.compile(r"agent_run_id:\s*[0-9a-fA-F-]{36}")
+AGENT_RUN_ID_JSON_RE = re.compile(r'"agent_run_id"\s*:\s*"[0-9a-fA-F-]{36}"')
+TEST_SUBAGENT_TMP_PATH_RE = re.compile(r"/var/tmp/test-subagent-retrieve-[A-Za-z0-9_-]+")
+TEST_SUBAGENT_CWD_RE = re.compile(
+    r"Current working directory:\s*/var/tmp/test-subagent-retrieve-[^\s]+"
+)
+ARTIFACT_ID_LABEL_RE = re.compile(r"Artifact ID:\s*agent_[0-9a-f]{16}")
+OUTPUT_CAP_SAVED_LINE_PREFIX = "Saved full output:"
+OUTPUT_CAP_PATH_PLACEHOLDER_RE = re.compile(r"\{\{output_cap_path_(\d+)\}\}")
+PARENT_RUN_ID_PLACEHOLDER = "{{parent_run_id}}"
+AGENT_RUN_ID_PLACEHOLDER = "{{agent_run_id}}"
+TEST_SUBAGENT_TMP_PLACEHOLDER = "{{test_subagent_tmp}}"
+
+
+def _output_cap_path_placeholder(index: int) -> str:
+    return f"{{{{output_cap_path_{index}}}}}"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -65,6 +87,8 @@ class Settings:
     replay_chunk_delay_ms: float
     admin_token: str | None
     cache_normalize_messages: bool
+    cache_template_artifact_ids: bool
+    cache_template_output_cap_paths: bool
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -88,6 +112,10 @@ class Settings:
             replay_chunk_delay_ms=float(os.getenv("LLAMA_PROXY_REPLAY_CHUNK_DELAY_MS", "0")),
             admin_token=os.getenv("LLAMA_PROXY_ADMIN_TOKEN") or None,
             cache_normalize_messages=_env_bool("LLAMA_PROXY_CACHE_NORMALIZE_MESSAGES", True),
+            cache_template_artifact_ids=_env_bool("LLAMA_PROXY_CACHE_TEMPLATE_ARTIFACT_IDS", True),
+            cache_template_output_cap_paths=_env_bool(
+                "LLAMA_PROXY_CACHE_TEMPLATE_OUTPUT_CAP_PATHS", True
+            ),
         )
 
 
@@ -162,7 +190,7 @@ def _strip_prologue_messages(messages: list[Any]) -> list[Any]:
     return messages[start:]
 
 
-def _normalize_body_for_cache_key(body: Any) -> Any:
+def _normalize_body_for_cache_key_messages(body: Any) -> Any:
     if not isinstance(body, dict):
         return body
     if not settings.cache_normalize_messages:
@@ -173,6 +201,537 @@ def _normalize_body_for_cache_key(body: Any) -> Any:
     normalized = copy.deepcopy(body)
     normalized["messages"] = _strip_prologue_messages(messages)
     return normalized
+
+
+def _collect_strings(value: Any, out: list[str]) -> None:
+    if isinstance(value, str):
+        out.append(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _collect_strings(item, out)
+    elif isinstance(value, list):
+        for item in value:
+            _collect_strings(item, out)
+
+
+def _extract_agent_artifact_id_from_text(text: str) -> str | None:
+    if not text:
+        return None
+    after_label = text.split(ARTIFACT_LABEL, 1)
+    if len(after_label) == 2:
+        match = AGENT_ARTIFACT_ID_RE.search(after_label[1])
+        if match:
+            return match.group(0)
+    match = AGENT_ARTIFACT_ID_RE.search(text)
+    return match.group(0) if match else None
+
+
+def _extract_agent_artifact_id_from_json(value: Any) -> str | None:
+    strings: list[str] = []
+    _collect_strings(value, strings)
+    for text in strings:
+        if ARTIFACT_LABEL in text:
+            artifact_id = _extract_agent_artifact_id_from_text(text)
+            if artifact_id:
+                return artifact_id
+    for text in strings:
+        artifact_id = _extract_agent_artifact_id_from_text(text)
+        if artifact_id:
+            return artifact_id
+    return None
+
+
+def _extract_agent_artifact_id_from_bytes(body: bytes) -> str | None:
+    parsed = _safe_request_json(body)
+    if parsed is not None:
+        return _extract_agent_artifact_id_from_json(parsed)
+    if not body:
+        return None
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return _extract_agent_artifact_id_from_text(text)
+
+
+def _extract_output_cap_paths_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+    paths: list[str] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        if OUTPUT_CAP_SAVED_LINE_PREFIX not in line:
+            continue
+        idx = line.find(OUTPUT_CAP_SAVED_LINE_PREFIX)
+        path = line[idx + len(OUTPUT_CAP_SAVED_LINE_PREFIX) :].strip()
+        if path and path not in seen:
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def _extract_output_cap_paths_from_json(value: Any) -> list[str]:
+    strings: list[str] = []
+    _collect_strings(value, strings)
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for text in strings:
+        for path in _extract_output_cap_paths_from_text(text):
+            if path not in seen:
+                seen.add(path)
+                ordered.append(path)
+    return ordered
+
+
+def _extract_output_cap_paths_from_bytes(body: bytes) -> list[str]:
+    parsed = _safe_request_json(body)
+    if parsed is not None:
+        return _extract_output_cap_paths_from_json(parsed)
+    if not body:
+        return []
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return []
+    return _extract_output_cap_paths_from_text(text)
+
+
+def _apply_output_cap_path_placeholders_to_string(text: str, paths: list[str]) -> str:
+    if not text or not paths:
+        return text
+    for index, path in enumerate(paths):
+        if path:
+            text = text.replace(path, _output_cap_path_placeholder(index))
+    return text
+
+
+def _template_output_cap_paths_in_value(value: Any, paths: list[str]) -> Any:
+    if not paths:
+        return value
+    if isinstance(value, str):
+        return _apply_output_cap_path_placeholders_to_string(value, paths)
+    if isinstance(value, dict):
+        return {k: _template_output_cap_paths_in_value(v, paths) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_template_output_cap_paths_in_value(item, paths) for item in value]
+    return value
+
+
+def _template_output_cap_paths_in_bytes(data: bytes, paths: list[str]) -> bytes:
+    if not data or not paths:
+        return data
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data
+    return _apply_output_cap_path_placeholders_to_string(text, paths).encode("utf-8")
+
+
+def _substitute_output_cap_placeholders_in_string(text: str, paths: list[str]) -> str | None:
+    if not text:
+        return text
+    if not paths:
+        if OUTPUT_CAP_PATH_PLACEHOLDER_RE.search(text):
+            return None
+        return text
+    max_index = -1
+    for match in OUTPUT_CAP_PATH_PLACEHOLDER_RE.finditer(text):
+        max_index = max(max_index, int(match.group(1)))
+    if max_index >= len(paths):
+        return None
+    for index, path in enumerate(paths):
+        text = text.replace(_output_cap_path_placeholder(index), path)
+    if OUTPUT_CAP_PATH_PLACEHOLDER_RE.search(text):
+        return None
+    return text
+
+
+def _substitute_output_cap_placeholders_in_bytes(data: bytes, paths: list[str]) -> bytes | None:
+    if not data:
+        return data
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data
+    substituted = _substitute_output_cap_placeholders_in_string(text, paths)
+    if substituted is None:
+        return None
+    return substituted.encode("utf-8")
+
+
+def _template_agent_artifact_ids_in_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return AGENT_ARTIFACT_ID_RE.sub(AGENT_ARTIFACT_PLACEHOLDER, value)
+    if isinstance(value, dict):
+        return {k: _template_agent_artifact_ids_in_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_template_agent_artifact_ids_in_value(item) for item in value]
+    return value
+
+
+def _template_agent_artifact_ids_in_bytes(data: bytes) -> bytes:
+    if not data:
+        return data
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data
+    return AGENT_ARTIFACT_ID_RE.sub(AGENT_ARTIFACT_PLACEHOLDER, text).encode("utf-8")
+
+
+def _normalize_dynamic_request_fields_in_string(text: str) -> str:
+    if not text:
+        return text
+    text = PARENT_RUN_ID_LABEL_RE.sub(f"parent_run_id: {PARENT_RUN_ID_PLACEHOLDER}", text)
+    text = PARENT_RUN_ID_JSON_RE.sub(f'"parent_run_id":"{PARENT_RUN_ID_PLACEHOLDER}"', text)
+    text = AGENT_RUN_ID_LABEL_RE.sub(f"agent_run_id: {AGENT_RUN_ID_PLACEHOLDER}", text)
+    text = AGENT_RUN_ID_JSON_RE.sub(f'"agent_run_id":"{AGENT_RUN_ID_PLACEHOLDER}"', text)
+    text = TEST_SUBAGENT_CWD_RE.sub(
+        f"Current working directory: {TEST_SUBAGENT_TMP_PLACEHOLDER}", text
+    )
+    text = TEST_SUBAGENT_TMP_PATH_RE.sub(TEST_SUBAGENT_TMP_PLACEHOLDER, text)
+    text = ARTIFACT_ID_LABEL_RE.sub(f"Artifact ID: {AGENT_ARTIFACT_PLACEHOLDER}", text)
+    return text
+
+
+def _normalize_dynamic_request_fields_in_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _normalize_dynamic_request_fields_in_string(value)
+    if isinstance(value, dict):
+        return {k: _normalize_dynamic_request_fields_in_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_normalize_dynamic_request_fields_in_value(item) for item in value]
+    return value
+
+
+def _template_tool_call_arguments_string(arguments: str, output_cap_paths: list[str] | None = None) -> str:
+    if not arguments:
+        return arguments
+    templated = AGENT_ARTIFACT_ID_RE.sub(AGENT_ARTIFACT_PLACEHOLDER, arguments)
+    if output_cap_paths:
+        templated = _apply_output_cap_path_placeholders_to_string(templated, output_cap_paths)
+    return templated
+
+
+def _template_tool_calls_in_json_value(
+    value: Any,
+    output_cap_paths: list[str] | None = None,
+) -> Any:
+    cap_paths = output_cap_paths or []
+    if isinstance(value, dict):
+        out = {k: _template_tool_calls_in_json_value(v, output_cap_paths) for k, v in value.items()}
+        if "tool_calls" in out and isinstance(out["tool_calls"], list):
+            for tc in out["tool_calls"]:
+                if isinstance(tc, dict) and isinstance(tc.get("function"), dict):
+                    fn = tc["function"]
+                    if isinstance(fn.get("arguments"), str):
+                        fn["arguments"] = _template_tool_call_arguments_string(
+                            fn["arguments"], cap_paths
+                        )
+        if "function_call" in out and isinstance(out["function_call"], dict):
+            fc = out["function_call"]
+            if isinstance(fc.get("arguments"), str):
+                fc["arguments"] = _template_tool_call_arguments_string(fc["arguments"], cap_paths)
+        if "delta" in out and isinstance(out["delta"], dict):
+            delta = out["delta"]
+            if isinstance(delta.get("tool_calls"), list):
+                for tc in delta["tool_calls"]:
+                    if isinstance(tc, dict) and isinstance(tc.get("function"), dict):
+                        fn = tc["function"]
+                        if isinstance(fn.get("arguments"), str):
+                            fn["arguments"] = _template_tool_call_arguments_string(
+                                fn["arguments"], cap_paths
+                            )
+            if isinstance(delta.get("function_call"), dict):
+                fc = delta["function_call"]
+                if isinstance(fc.get("arguments"), str):
+                    fc["arguments"] = _template_tool_call_arguments_string(
+                        fc["arguments"], cap_paths
+                    )
+        return out
+    if isinstance(value, list):
+        return [_template_tool_calls_in_json_value(item, output_cap_paths) for item in value]
+    return value
+
+
+def _sse_blocks_from_bytes(data: bytes) -> list[bytes]:
+    if not data:
+        return []
+    text = data.decode("utf-8")
+    normalized = text.replace("\r\n", "\n")
+    blocks = normalized.split("\n\n")
+    return [block.encode("utf-8") for block in blocks if block.strip()]
+
+
+def _parse_sse_data_payload(block: bytes) -> tuple[str, Any] | None:
+    try:
+        text = block.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    data_lines = [ln for ln in text.split("\n") if ln.startswith("data:")]
+    if not data_lines:
+        return None
+    payload = "\n".join(ln[len("data:") :].lstrip() for ln in data_lines)
+    if payload.strip() == "[DONE]":
+        return ("[DONE]", None)
+    try:
+        return ("json", json.loads(payload))
+    except json.JSONDecodeError:
+        return ("raw", payload)
+
+
+def _accumulate_tool_arguments_from_sse_obj(
+    obj: Any,
+    buffers: dict[tuple[int, int], str],
+) -> None:
+    if not isinstance(obj, dict):
+        return
+    choices = obj.get("choices")
+    if not isinstance(choices, list):
+        return
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        choice_index = int(choice.get("index", 0))
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            message = choice.get("message")
+            if isinstance(message, dict):
+                _accumulate_tool_arguments_from_message(message, buffers, choice_index)
+            continue
+        _accumulate_tool_arguments_from_delta(delta, buffers, choice_index)
+
+
+def _accumulate_tool_arguments_from_message(
+    message: dict[str, Any],
+    buffers: dict[tuple[int, int], str],
+    choice_index: int,
+) -> None:
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            tc_index = int(tc.get("index", 0))
+            fn = tc.get("function")
+            if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                key = (choice_index, tc_index)
+                buffers[key] = buffers.get(key, "") + fn["arguments"]
+
+
+def _accumulate_tool_arguments_from_delta(
+    delta: dict[str, Any],
+    buffers: dict[tuple[int, int], str],
+    choice_index: int,
+) -> None:
+    tool_calls = delta.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            tc_index = int(tc.get("index", 0))
+            fn = tc.get("function")
+            if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                key = (choice_index, tc_index)
+                buffers[key] = buffers.get(key, "") + fn["arguments"]
+    function_call = delta.get("function_call")
+    if isinstance(function_call, dict) and isinstance(function_call.get("arguments"), str):
+        key = (choice_index, 0)
+        buffers[key] = buffers.get(key, "") + function_call["arguments"]
+
+
+def _template_agent_artifact_ids_in_sse_stream(
+    data: bytes,
+    output_cap_paths: list[str] | None = None,
+) -> bytes:
+    if not data:
+        return data
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return _template_agent_artifact_ids_in_bytes(data)
+
+    blocks = _sse_blocks_from_bytes(data)
+    if not blocks:
+        return _template_agent_artifact_ids_in_bytes(data)
+
+    parsed_blocks: list[tuple[bytes, str, Any | None]] = []
+    buffers: dict[tuple[int, int], str] = {}
+    for block in blocks:
+        parsed = _parse_sse_data_payload(block)
+        if parsed is None:
+            parsed_blocks.append((block, "raw", None))
+            continue
+        kind, payload = parsed
+        if kind == "json" and isinstance(payload, dict):
+            _accumulate_tool_arguments_from_sse_obj(payload, buffers)
+        parsed_blocks.append((block, kind, payload))
+
+    cap_paths = output_cap_paths or []
+    templated_buffers = {
+        key: _template_tool_call_arguments_string(args, cap_paths) for key, args in buffers.items()
+    }
+    if not templated_buffers:
+        fallback = _template_agent_artifact_ids_in_bytes(data)
+        if cap_paths:
+            fallback = _template_output_cap_paths_in_bytes(fallback, cap_paths)
+        return fallback
+
+    last_tool_event_index: dict[tuple[int, int], int] = {}
+    for idx, (_block, kind, payload) in enumerate(parsed_blocks):
+        if kind != "json" or not isinstance(payload, dict):
+            continue
+        choices = payload.get("choices")
+        if not isinstance(choices, list):
+            continue
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            choice_index = int(choice.get("index", 0))
+            delta = choice.get("delta")
+            if isinstance(delta, dict):
+                tool_calls = delta.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    for tc in tool_calls:
+                        if isinstance(tc, dict):
+                            tc_index = int(tc.get("index", 0))
+                            last_tool_event_index[(choice_index, tc_index)] = idx
+                if isinstance(delta.get("function_call"), dict):
+                    last_tool_event_index[(choice_index, 0)] = idx
+
+    out_parts: list[str] = []
+    for idx, (_block, kind, payload) in enumerate(parsed_blocks):
+        if kind == "[DONE]":
+            out_parts.append("data: [DONE]\n\n")
+            continue
+        if kind == "raw":
+            out_parts.append(_block.decode("utf-8") + "\n\n")
+            continue
+        if kind != "json" or not isinstance(payload, dict):
+            out_parts.append(_block.decode("utf-8") + "\n\n")
+            continue
+
+        rebuilt = copy.deepcopy(payload)
+        choices = rebuilt.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                choice_index = int(choice.get("index", 0))
+                delta = choice.get("delta")
+                if not isinstance(delta, dict):
+                    message = choice.get("message")
+                    if isinstance(message, dict):
+                        tool_calls = message.get("tool_calls")
+                        if isinstance(tool_calls, list):
+                            for tc in tool_calls:
+                                if not isinstance(tc, dict):
+                                    continue
+                                tc_index = int(tc.get("index", 0))
+                                key = (choice_index, tc_index)
+                                if key in templated_buffers and idx == last_tool_event_index.get(
+                                    key, idx
+                                ):
+                                    fn = tc.setdefault("function", {})
+                                    if isinstance(fn, dict):
+                                        fn["arguments"] = templated_buffers[key]
+                    continue
+                tool_calls = delta.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    for tc in tool_calls:
+                        if not isinstance(tc, dict):
+                            continue
+                        tc_index = int(tc.get("index", 0))
+                        key = (choice_index, tc_index)
+                        fn = tc.setdefault("function", {})
+                        if not isinstance(fn, dict):
+                            continue
+                        if key in templated_buffers and idx == last_tool_event_index.get(key, -1):
+                            fn["arguments"] = templated_buffers[key]
+                        elif isinstance(fn.get("arguments"), str):
+                            fn["arguments"] = ""
+                function_call = delta.get("function_call")
+                if isinstance(function_call, dict):
+                    key = (choice_index, 0)
+                    if key in templated_buffers and idx == last_tool_event_index.get(key, -1):
+                        function_call["arguments"] = templated_buffers[key]
+                    elif isinstance(function_call.get("arguments"), str):
+                        function_call["arguments"] = ""
+
+        out_parts.append("data: " + _json_dumps(rebuilt) + "\n\n")
+
+    result = "".join(out_parts).encode("utf-8")
+    if cap_paths:
+        result = _template_output_cap_paths_in_bytes(result, cap_paths)
+    return result
+
+
+def _template_response_bytes_for_cache(data: bytes, output_cap_paths: list[str] | None = None) -> bytes:
+    cap_paths = output_cap_paths or []
+    if not data:
+        return data
+    if b"data:" in data and (b"tool_calls" in data or b"function_call" in data):
+        templated = _template_agent_artifact_ids_in_sse_stream(data, cap_paths)
+        if (
+            AGENT_ARTIFACT_PLACEHOLDER.encode("utf-8") in templated
+            or templated != data
+            or (cap_paths and any(_output_cap_path_placeholder(i).encode() in templated for i in range(len(cap_paths))))
+        ):
+            return templated
+    try:
+        obj = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        out = _template_agent_artifact_ids_in_bytes(data)
+        return _template_output_cap_paths_in_bytes(out, cap_paths) if cap_paths else out
+    if isinstance(obj, dict) and "choices" in obj:
+        templated_obj = _template_tool_calls_in_json_value(obj, cap_paths)
+        if settings.cache_template_artifact_ids:
+            templated_obj = _template_agent_artifact_ids_in_value(templated_obj)
+        if cap_paths:
+            templated_obj = _template_output_cap_paths_in_value(templated_obj, cap_paths)
+        return _json_dumps(templated_obj).encode("utf-8")
+    out = _template_agent_artifact_ids_in_bytes(data)
+    return _template_output_cap_paths_in_bytes(out, cap_paths) if cap_paths else out
+
+
+def _substitute_agent_artifact_placeholder_in_bytes(data: bytes, artifact_id: str | None) -> bytes:
+    if not artifact_id or not data:
+        return data
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data
+    return text.replace(AGENT_ARTIFACT_PLACEHOLDER, artifact_id).encode("utf-8")
+
+
+def _substitute_cached_response_bytes(
+    data: bytes,
+    *,
+    artifact_id: str | None,
+    output_cap_paths: list[str],
+) -> bytes | None:
+    if not data:
+        return data
+    body = data
+    if settings.cache_template_artifact_ids and artifact_id:
+        body = _substitute_agent_artifact_placeholder_in_bytes(body, artifact_id)
+    if settings.cache_template_output_cap_paths:
+        substituted = _substitute_output_cap_placeholders_in_bytes(body, output_cap_paths)
+        if substituted is None:
+            return None
+        body = substituted
+    return body
+
+
+def _normalize_body_for_cache_key(body: Any) -> Any:
+    body = _normalize_body_for_cache_key_messages(body)
+    if settings.cache_template_artifact_ids:
+        body = _template_agent_artifact_ids_in_value(body)
+    body = _normalize_dynamic_request_fields_in_value(body)
+    if settings.cache_template_output_cap_paths:
+        cap_paths = _extract_output_cap_paths_from_json(body)
+        body = _template_output_cap_paths_in_value(body, cap_paths)
+    return body
 
 
 def _cache_key(method: str, path: str, query: str, body: bytes) -> tuple[str, dict[str, Any]]:
@@ -320,6 +879,8 @@ async def health() -> dict[str, Any]:
         "cache_dir": str(settings.cache_dir),
         "cache_paths": sorted(settings.cache_paths),
         "cache_normalize_messages": settings.cache_normalize_messages,
+        "cache_template_artifact_ids": settings.cache_template_artifact_ids,
+        "cache_template_output_cap_paths": settings.cache_template_output_cap_paths,
     }
 
 
@@ -351,12 +912,36 @@ def _outbound_headers(record: dict[str, Any], cache_marker: str | None = None) -
     return headers
 
 
-async def _replay(record: dict[str, Any], *, cache_marker: str | None = None) -> Response:
+async def _replay(
+    record: dict[str, Any],
+    *,
+    cache_marker: str | None = None,
+    artifact_id: str | None = None,
+    output_cap_paths: list[str] | None = None,
+) -> Response | None:
     status_code = int(record.get("upstream", {}).get("status_code", 200))
     headers = _outbound_headers(record, cache_marker)
+    cap_paths = output_cap_paths if output_cap_paths is not None else []
+    templating_enabled = settings.cache_template_artifact_ids or settings.cache_template_output_cap_paths
 
     if record.get("stream"):
         chunks = [_from_b64(item) for item in record.get("chunks_b64", [])]
+        if templating_enabled:
+            payload = _substitute_cached_response_bytes(
+                b"".join(chunks),
+                artifact_id=artifact_id,
+                output_cap_paths=cap_paths,
+            )
+            if payload is None:
+                return None
+
+            async def generate():
+                yield payload
+                delay = _replay_delay_s(payload)
+                if delay:
+                    await asyncio.sleep(delay)
+
+            return StreamingResponse(generate(), status_code=status_code, headers=headers)
 
         async def generate():
             for chunk in chunks:
@@ -367,8 +952,18 @@ async def _replay(record: dict[str, Any], *, cache_marker: str | None = None) ->
 
         return StreamingResponse(generate(), status_code=status_code, headers=headers)
 
+    body = _from_b64(record.get("body_b64", ""))
+    if templating_enabled:
+        substituted = _substitute_cached_response_bytes(
+            body,
+            artifact_id=artifact_id,
+            output_cap_paths=cap_paths,
+        )
+        if substituted is None:
+            return None
+        body = substituted
     return Response(
-        content=_from_b64(record.get("body_b64", "")),
+        content=body,
         status_code=status_code,
         headers=headers,
     )
@@ -420,7 +1015,17 @@ async def _proxy_and_record_nonstream(
                     "headers": headers,
                     "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
                 },
-                "body_b64": _body_b64(upstream.content),
+                "body_b64": _body_b64(
+                    _template_response_bytes_for_cache(
+                        upstream.content,
+                        _extract_output_cap_paths_from_bytes(body)
+                        if settings.cache_template_output_cap_paths
+                        else None,
+                    )
+                    if settings.cache_template_artifact_ids
+                    or settings.cache_template_output_cap_paths
+                    else upstream.content
+                ),
             },
         )
 
@@ -457,6 +1062,14 @@ async def _proxy_and_record_stream(
         finally:
             await cm.__aexit__(None, None, None)
             if completed and 200 <= upstream.status_code < 300:
+                stream_body = b"".join(chunks)
+                if settings.cache_template_artifact_ids or settings.cache_template_output_cap_paths:
+                    stream_body = _template_response_bytes_for_cache(
+                        stream_body,
+                        _extract_output_cap_paths_from_bytes(body)
+                        if settings.cache_template_output_cap_paths
+                        else None,
+                    )
                 _write_record(
                     key,
                     {
@@ -469,7 +1082,7 @@ async def _proxy_and_record_stream(
                             "headers": headers,
                             "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
                         },
-                        "chunks_b64": [_body_b64(chunk) for chunk in chunks],
+                        "chunks_b64": [_body_b64(stream_body)],
                     },
                 )
             lock.release()
@@ -486,9 +1099,24 @@ async def proxy(request: Request, path: str) -> Response:
         return await _proxy_uncached(request, path, body)
 
     key, material = _cache_key(request.method, path, request.url.query, body)
+    artifact_id = (
+        _extract_agent_artifact_id_from_bytes(body) if settings.cache_template_artifact_ids else None
+    )
+    output_cap_paths = (
+        _extract_output_cap_paths_from_bytes(body)
+        if settings.cache_template_output_cap_paths
+        else []
+    )
     cached = _read_record(key)
     if cached is not None:
-        return await _replay(cached, cache_marker="hit")
+        replayed = await _replay(
+            cached,
+            cache_marker="hit",
+            artifact_id=artifact_id,
+            output_cap_paths=output_cap_paths,
+        )
+        if replayed is not None:
+            return replayed
 
     lock = await _lock_for(key)
     await lock.acquire()
@@ -497,7 +1125,14 @@ async def proxy(request: Request, path: str) -> Response:
         cached = _read_record(key)
         if cached is not None:
             lock.release()
-            return await _replay(cached, cache_marker="hit")
+            replayed = await _replay(
+                cached,
+                cache_marker="hit",
+                artifact_id=artifact_id,
+                output_cap_paths=output_cap_paths,
+            )
+            if replayed is not None:
+                return replayed
 
         if stream_request:
             try:
