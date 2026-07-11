@@ -69,6 +69,7 @@ If `LLAMA_PROXY_ADMIN_TOKEN` is set, cache admin endpoints require:
 | `LLAMA_PROXY_CACHE_NORMALIZE_MESSAGES` | `true` | when enabled, cache key ignores volatile chat prologue (see below); set `false` for full-body keys |
 | `LLAMA_PROXY_CACHE_TEMPLATE_ARTIFACT_IDS` | `true` | when enabled, normalize `agent_[0-9a-f]{16}` ids in cache keys and cassettes (see below); set `false` to store/replay raw ids |
 | `LLAMA_PROXY_CACHE_TEMPLATE_OUTPUT_CAP_PATHS` | `true` | when enabled, normalize Hatfield output-cap `Saved full output:` paths in cache keys and cassettes (see below); set `false` for raw paths |
+| `LLAMA_PROXY_CACHE_TEMPLATE_WRITE_RESULT_PATHS` | `true` | when enabled, normalize Hatfield write-tool `Successfully wrote <n> bytes to <path>` paths in cache keys and cassettes (see below); set `false` for raw paths |
 
 ## Cache key
 
@@ -118,6 +119,19 @@ When `LLAMA_PROXY_CACHE_TEMPLATE_OUTPUT_CAP_PATHS` is enabled (default), paths i
 Upstream requests on a cache miss still use the **full original** body. Clear the cache after changing this setting.
 
 Ephemeral check (not pytest): `scripts/output_cap_smoke.py`.
+
+### Write-tool success paths
+
+When `LLAMA_PROXY_CACHE_TEMPLATE_WRITE_RESULT_PATHS` is enabled (default), paths from Hatfield write-tool success text are treated as volatile:
+
+- **Extraction:** scan all JSON string values for substrings matching `Successfully wrote <integer> bytes to <path>`; capture `<path>` (trimmed). Deduplicate by first appearance. Unrelated filesystem paths without that pattern are not normalized.
+- **Cache key:** after message/artifact/output-cap/dynamic-field normalization, replace every exact occurrence of each extracted path in JSON string values with indexed placeholders `{{write_result_path_0}}`, `{{write_result_path_1}}`, …
+- **Record:** successful responses are stored with those paths templated (JSON bodies, tool-call `arguments`, and streaming SSE via assembled tool-argument buffers plus a final pass over the SSE bytes).
+- **Replay:** placeholders are replaced with the current request’s extracted paths in order. If substitution cannot be satisfied, the cassette is treated as unusable and the proxy falls through to an upstream miss.
+
+Upstream requests on a cache miss still use the **full original** body. Clear the cache after changing this setting.
+
+Ephemeral check (not pytest): `scripts/write_result_smoke.py`.
 
 ## systemd
 

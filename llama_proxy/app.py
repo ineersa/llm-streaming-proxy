@@ -59,6 +59,8 @@ TEST_SUBAGENT_CWD_RE = re.compile(
 ARTIFACT_ID_LABEL_RE = re.compile(r"Artifact ID:\s*agent_[0-9a-f]{16}")
 OUTPUT_CAP_SAVED_LINE_PREFIX = "Saved full output:"
 OUTPUT_CAP_PATH_PLACEHOLDER_RE = re.compile(r"\{\{output_cap_path_(\d+)\}\}")
+WRITE_RESULT_SUCCESS_RE = re.compile(r"Successfully wrote \d+ bytes to ([^\n]+)")
+WRITE_RESULT_PATH_PLACEHOLDER_RE = re.compile(r"\{\{write_result_path_(\d+)\}\}")
 PARENT_RUN_ID_PLACEHOLDER = "{{parent_run_id}}"
 AGENT_RUN_ID_PLACEHOLDER = "{{agent_run_id}}"
 TEST_SUBAGENT_TMP_PLACEHOLDER = "{{test_subagent_tmp}}"
@@ -66,6 +68,10 @@ TEST_SUBAGENT_TMP_PLACEHOLDER = "{{test_subagent_tmp}}"
 
 def _output_cap_path_placeholder(index: int) -> str:
     return f"{{{{output_cap_path_{index}}}}}"
+
+
+def _write_result_path_placeholder(index: int) -> str:
+    return f"{{{{write_result_path_{index}}}}}"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -89,6 +95,7 @@ class Settings:
     cache_normalize_messages: bool
     cache_template_artifact_ids: bool
     cache_template_output_cap_paths: bool
+    cache_template_write_result_paths: bool
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -115,6 +122,9 @@ class Settings:
             cache_template_artifact_ids=_env_bool("LLAMA_PROXY_CACHE_TEMPLATE_ARTIFACT_IDS", True),
             cache_template_output_cap_paths=_env_bool(
                 "LLAMA_PROXY_CACHE_TEMPLATE_OUTPUT_CAP_PATHS", True
+            ),
+            cache_template_write_result_paths=_env_bool(
+                "LLAMA_PROXY_CACHE_TEMPLATE_WRITE_RESULT_PATHS", True
             ),
         )
 
@@ -297,63 +307,174 @@ def _extract_output_cap_paths_from_bytes(body: bytes) -> list[str]:
 
 
 def _apply_output_cap_path_placeholders_to_string(text: str, paths: list[str]) -> str:
+    return _apply_indexed_path_placeholders_to_string(text, paths, _output_cap_path_placeholder)
+
+
+def _template_output_cap_paths_in_value(value: Any, paths: list[str]) -> Any:
+    return _template_indexed_paths_in_value(value, paths, _output_cap_path_placeholder)
+
+
+def _template_output_cap_paths_in_bytes(data: bytes, paths: list[str]) -> bytes:
+    return _template_indexed_paths_in_bytes(data, paths, _output_cap_path_placeholder)
+
+
+def _substitute_output_cap_placeholders_in_string(text: str, paths: list[str]) -> str | None:
+    return _substitute_indexed_placeholders_in_string(
+        text, paths, OUTPUT_CAP_PATH_PLACEHOLDER_RE, _output_cap_path_placeholder
+    )
+
+
+def _substitute_output_cap_placeholders_in_bytes(data: bytes, paths: list[str]) -> bytes | None:
+    return _substitute_indexed_placeholders_in_bytes(
+        data, paths, OUTPUT_CAP_PATH_PLACEHOLDER_RE, _output_cap_path_placeholder
+    )
+
+
+def _extract_write_result_paths_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+    paths: list[str] = []
+    seen: set[str] = set()
+    for match in WRITE_RESULT_SUCCESS_RE.finditer(text):
+        path = match.group(1).strip()
+        if path and path not in seen:
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def _extract_write_result_paths_from_json(value: Any) -> list[str]:
+    strings: list[str] = []
+    _collect_strings(value, strings)
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for text in strings:
+        for path in _extract_write_result_paths_from_text(text):
+            if path not in seen:
+                seen.add(path)
+                ordered.append(path)
+    return ordered
+
+
+def _extract_write_result_paths_from_bytes(body: bytes) -> list[str]:
+    parsed = _safe_request_json(body)
+    if parsed is not None:
+        return _extract_write_result_paths_from_json(parsed)
+    if not body:
+        return []
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return []
+    return _extract_write_result_paths_from_text(text)
+
+
+def _apply_write_result_path_placeholders_to_string(text: str, paths: list[str]) -> str:
+    return _apply_indexed_path_placeholders_to_string(text, paths, _write_result_path_placeholder)
+
+
+def _template_write_result_paths_in_value(value: Any, paths: list[str]) -> Any:
+    return _template_indexed_paths_in_value(value, paths, _write_result_path_placeholder)
+
+
+def _template_write_result_paths_in_bytes(data: bytes, paths: list[str]) -> bytes:
+    return _template_indexed_paths_in_bytes(data, paths, _write_result_path_placeholder)
+
+
+def _substitute_write_result_placeholders_in_string(text: str, paths: list[str]) -> str | None:
+    return _substitute_indexed_placeholders_in_string(
+        text, paths, WRITE_RESULT_PATH_PLACEHOLDER_RE, _write_result_path_placeholder
+    )
+
+
+def _substitute_write_result_placeholders_in_bytes(data: bytes, paths: list[str]) -> bytes | None:
+    return _substitute_indexed_placeholders_in_bytes(
+        data, paths, WRITE_RESULT_PATH_PLACEHOLDER_RE, _write_result_path_placeholder
+    )
+
+
+def _apply_indexed_path_placeholders_to_string(
+    text: str,
+    paths: list[str],
+    placeholder_fn: Any,
+) -> str:
     if not text or not paths:
         return text
     for index, path in enumerate(paths):
         if path:
-            text = text.replace(path, _output_cap_path_placeholder(index))
+            text = text.replace(path, placeholder_fn(index))
     return text
 
 
-def _template_output_cap_paths_in_value(value: Any, paths: list[str]) -> Any:
+def _template_indexed_paths_in_value(
+    value: Any,
+    paths: list[str],
+    placeholder_fn: Any,
+) -> Any:
     if not paths:
         return value
     if isinstance(value, str):
-        return _apply_output_cap_path_placeholders_to_string(value, paths)
+        return _apply_indexed_path_placeholders_to_string(value, paths, placeholder_fn)
     if isinstance(value, dict):
-        return {k: _template_output_cap_paths_in_value(v, paths) for k, v in value.items()}
+        return {
+            k: _template_indexed_paths_in_value(v, paths, placeholder_fn) for k, v in value.items()
+        }
     if isinstance(value, list):
-        return [_template_output_cap_paths_in_value(item, paths) for item in value]
+        return [_template_indexed_paths_in_value(item, paths, placeholder_fn) for item in value]
     return value
 
 
-def _template_output_cap_paths_in_bytes(data: bytes, paths: list[str]) -> bytes:
+def _template_indexed_paths_in_bytes(
+    data: bytes,
+    paths: list[str],
+    placeholder_fn: Any,
+) -> bytes:
     if not data or not paths:
         return data
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return data
-    return _apply_output_cap_path_placeholders_to_string(text, paths).encode("utf-8")
+    return _apply_indexed_path_placeholders_to_string(text, paths, placeholder_fn).encode("utf-8")
 
 
-def _substitute_output_cap_placeholders_in_string(text: str, paths: list[str]) -> str | None:
+def _substitute_indexed_placeholders_in_string(
+    text: str,
+    paths: list[str],
+    placeholder_re: re.Pattern[str],
+    placeholder_fn: Any,
+) -> str | None:
     if not text:
         return text
     if not paths:
-        if OUTPUT_CAP_PATH_PLACEHOLDER_RE.search(text):
+        if placeholder_re.search(text):
             return None
         return text
     max_index = -1
-    for match in OUTPUT_CAP_PATH_PLACEHOLDER_RE.finditer(text):
+    for match in placeholder_re.finditer(text):
         max_index = max(max_index, int(match.group(1)))
     if max_index >= len(paths):
         return None
     for index, path in enumerate(paths):
-        text = text.replace(_output_cap_path_placeholder(index), path)
-    if OUTPUT_CAP_PATH_PLACEHOLDER_RE.search(text):
+        text = text.replace(placeholder_fn(index), path)
+    if placeholder_re.search(text):
         return None
     return text
 
 
-def _substitute_output_cap_placeholders_in_bytes(data: bytes, paths: list[str]) -> bytes | None:
+def _substitute_indexed_placeholders_in_bytes(
+    data: bytes,
+    paths: list[str],
+    placeholder_re: re.Pattern[str],
+    placeholder_fn: Any,
+) -> bytes | None:
     if not data:
         return data
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return data
-    substituted = _substitute_output_cap_placeholders_in_string(text, paths)
+    substituted = _substitute_indexed_placeholders_in_string(text, paths, placeholder_re, placeholder_fn)
     if substituted is None:
         return None
     return substituted.encode("utf-8")
@@ -404,34 +525,47 @@ def _normalize_dynamic_request_fields_in_value(value: Any) -> Any:
     return value
 
 
-def _template_tool_call_arguments_string(arguments: str, output_cap_paths: list[str] | None = None) -> str:
+def _template_tool_call_arguments_string(
+    arguments: str,
+    output_cap_paths: list[str] | None = None,
+    write_result_paths: list[str] | None = None,
+) -> str:
     if not arguments:
         return arguments
     templated = AGENT_ARTIFACT_ID_RE.sub(AGENT_ARTIFACT_PLACEHOLDER, arguments)
     if output_cap_paths:
         templated = _apply_output_cap_path_placeholders_to_string(templated, output_cap_paths)
+    if write_result_paths:
+        templated = _apply_write_result_path_placeholders_to_string(templated, write_result_paths)
     return templated
 
 
 def _template_tool_calls_in_json_value(
     value: Any,
     output_cap_paths: list[str] | None = None,
+    write_result_paths: list[str] | None = None,
 ) -> Any:
     cap_paths = output_cap_paths or []
+    write_paths = write_result_paths or []
     if isinstance(value, dict):
-        out = {k: _template_tool_calls_in_json_value(v, output_cap_paths) for k, v in value.items()}
+        out = {
+            k: _template_tool_calls_in_json_value(v, output_cap_paths, write_result_paths)
+            for k, v in value.items()
+        }
         if "tool_calls" in out and isinstance(out["tool_calls"], list):
             for tc in out["tool_calls"]:
                 if isinstance(tc, dict) and isinstance(tc.get("function"), dict):
                     fn = tc["function"]
                     if isinstance(fn.get("arguments"), str):
                         fn["arguments"] = _template_tool_call_arguments_string(
-                            fn["arguments"], cap_paths
+                            fn["arguments"], cap_paths, write_paths
                         )
         if "function_call" in out and isinstance(out["function_call"], dict):
             fc = out["function_call"]
             if isinstance(fc.get("arguments"), str):
-                fc["arguments"] = _template_tool_call_arguments_string(fc["arguments"], cap_paths)
+                fc["arguments"] = _template_tool_call_arguments_string(
+                    fc["arguments"], cap_paths, write_paths
+                )
         if "delta" in out and isinstance(out["delta"], dict):
             delta = out["delta"]
             if isinstance(delta.get("tool_calls"), list):
@@ -446,11 +580,14 @@ def _template_tool_calls_in_json_value(
                 fc = delta["function_call"]
                 if isinstance(fc.get("arguments"), str):
                     fc["arguments"] = _template_tool_call_arguments_string(
-                        fc["arguments"], cap_paths
+                        fc["arguments"], cap_paths, write_paths
                     )
         return out
     if isinstance(value, list):
-        return [_template_tool_calls_in_json_value(item, output_cap_paths) for item in value]
+        return [
+            _template_tool_calls_in_json_value(item, output_cap_paths, write_result_paths)
+            for item in value
+        ]
     return value
 
 
@@ -543,6 +680,7 @@ def _accumulate_tool_arguments_from_delta(
 def _template_agent_artifact_ids_in_sse_stream(
     data: bytes,
     output_cap_paths: list[str] | None = None,
+    write_result_paths: list[str] | None = None,
 ) -> bytes:
     if not data:
         return data
@@ -568,13 +706,17 @@ def _template_agent_artifact_ids_in_sse_stream(
         parsed_blocks.append((block, kind, payload))
 
     cap_paths = output_cap_paths or []
+    write_paths = write_result_paths or []
     templated_buffers = {
-        key: _template_tool_call_arguments_string(args, cap_paths) for key, args in buffers.items()
+        key: _template_tool_call_arguments_string(args, cap_paths, write_paths)
+        for key, args in buffers.items()
     }
     if not templated_buffers:
         fallback = _template_agent_artifact_ids_in_bytes(data)
         if cap_paths:
             fallback = _template_output_cap_paths_in_bytes(fallback, cap_paths)
+        if write_paths:
+            fallback = _template_write_result_paths_in_bytes(fallback, write_paths)
         return fallback
 
     last_tool_event_index: dict[tuple[int, int], int] = {}
@@ -663,35 +805,61 @@ def _template_agent_artifact_ids_in_sse_stream(
     result = "".join(out_parts).encode("utf-8")
     if cap_paths:
         result = _template_output_cap_paths_in_bytes(result, cap_paths)
+    if write_paths:
+        result = _template_write_result_paths_in_bytes(result, write_paths)
     return result
 
 
-def _template_response_bytes_for_cache(data: bytes, output_cap_paths: list[str] | None = None) -> bytes:
+def _template_response_bytes_for_cache(
+    data: bytes,
+    output_cap_paths: list[str] | None = None,
+    write_result_paths: list[str] | None = None,
+) -> bytes:
     cap_paths = output_cap_paths or []
+    write_paths = write_result_paths or []
     if not data:
         return data
     if b"data:" in data and (b"tool_calls" in data or b"function_call" in data):
-        templated = _template_agent_artifact_ids_in_sse_stream(data, cap_paths)
+        templated = _template_agent_artifact_ids_in_sse_stream(data, cap_paths, write_paths)
         if (
             AGENT_ARTIFACT_PLACEHOLDER.encode("utf-8") in templated
             or templated != data
-            or (cap_paths and any(_output_cap_path_placeholder(i).encode() in templated for i in range(len(cap_paths))))
+            or (
+                cap_paths
+                and any(_output_cap_path_placeholder(i).encode() in templated for i in range(len(cap_paths)))
+            )
+            or (
+                write_paths
+                and any(
+                    _write_result_path_placeholder(i).encode() in templated for i in range(len(write_paths))
+                )
+            )
         ):
             return templated
     try:
         obj = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         out = _template_agent_artifact_ids_in_bytes(data)
-        return _template_output_cap_paths_in_bytes(out, cap_paths) if cap_paths else out
+        if cap_paths:
+            out = _template_output_cap_paths_in_bytes(out, cap_paths)
+        if write_paths:
+            out = _template_write_result_paths_in_bytes(out, write_paths)
+        return out
     if isinstance(obj, dict) and "choices" in obj:
-        templated_obj = _template_tool_calls_in_json_value(obj, cap_paths)
+        templated_obj = _template_tool_calls_in_json_value(obj, cap_paths, write_paths)
         if settings.cache_template_artifact_ids:
             templated_obj = _template_agent_artifact_ids_in_value(templated_obj)
         if cap_paths:
             templated_obj = _template_output_cap_paths_in_value(templated_obj, cap_paths)
+        if write_paths:
+            templated_obj = _template_write_result_paths_in_value(templated_obj, write_paths)
         return _json_dumps(templated_obj).encode("utf-8")
     out = _template_agent_artifact_ids_in_bytes(data)
-    return _template_output_cap_paths_in_bytes(out, cap_paths) if cap_paths else out
+    if cap_paths:
+        out = _template_output_cap_paths_in_bytes(out, cap_paths)
+    if write_paths:
+        out = _template_write_result_paths_in_bytes(out, write_paths)
+    return out
 
 
 def _substitute_agent_artifact_placeholder_in_bytes(data: bytes, artifact_id: str | None) -> bytes:
@@ -709,6 +877,7 @@ def _substitute_cached_response_bytes(
     *,
     artifact_id: str | None,
     output_cap_paths: list[str],
+    write_result_paths: list[str],
 ) -> bytes | None:
     if not data:
         return data
@@ -717,6 +886,11 @@ def _substitute_cached_response_bytes(
         body = _substitute_agent_artifact_placeholder_in_bytes(body, artifact_id)
     if settings.cache_template_output_cap_paths:
         substituted = _substitute_output_cap_placeholders_in_bytes(body, output_cap_paths)
+        if substituted is None:
+            return None
+        body = substituted
+    if settings.cache_template_write_result_paths:
+        substituted = _substitute_write_result_placeholders_in_bytes(body, write_result_paths)
         if substituted is None:
             return None
         body = substituted
@@ -731,6 +905,9 @@ def _normalize_body_for_cache_key(body: Any) -> Any:
     if settings.cache_template_output_cap_paths:
         cap_paths = _extract_output_cap_paths_from_json(body)
         body = _template_output_cap_paths_in_value(body, cap_paths)
+    if settings.cache_template_write_result_paths:
+        write_paths = _extract_write_result_paths_from_json(body)
+        body = _template_write_result_paths_in_value(body, write_paths)
     return body
 
 
@@ -881,6 +1058,7 @@ async def health() -> dict[str, Any]:
         "cache_normalize_messages": settings.cache_normalize_messages,
         "cache_template_artifact_ids": settings.cache_template_artifact_ids,
         "cache_template_output_cap_paths": settings.cache_template_output_cap_paths,
+        "cache_template_write_result_paths": settings.cache_template_write_result_paths,
     }
 
 
@@ -918,11 +1096,17 @@ async def _replay(
     cache_marker: str | None = None,
     artifact_id: str | None = None,
     output_cap_paths: list[str] | None = None,
+    write_result_paths: list[str] | None = None,
 ) -> Response | None:
     status_code = int(record.get("upstream", {}).get("status_code", 200))
     headers = _outbound_headers(record, cache_marker)
     cap_paths = output_cap_paths if output_cap_paths is not None else []
-    templating_enabled = settings.cache_template_artifact_ids or settings.cache_template_output_cap_paths
+    write_paths = write_result_paths if write_result_paths is not None else []
+    templating_enabled = (
+        settings.cache_template_artifact_ids
+        or settings.cache_template_output_cap_paths
+        or settings.cache_template_write_result_paths
+    )
 
     if record.get("stream"):
         chunks = [_from_b64(item) for item in record.get("chunks_b64", [])]
@@ -931,6 +1115,7 @@ async def _replay(
                 b"".join(chunks),
                 artifact_id=artifact_id,
                 output_cap_paths=cap_paths,
+                write_result_paths=write_paths,
             )
             if payload is None:
                 return None
@@ -958,6 +1143,7 @@ async def _replay(
             body,
             artifact_id=artifact_id,
             output_cap_paths=cap_paths,
+            write_result_paths=write_paths,
         )
         if substituted is None:
             return None
@@ -1021,9 +1207,15 @@ async def _proxy_and_record_nonstream(
                         _extract_output_cap_paths_from_bytes(body)
                         if settings.cache_template_output_cap_paths
                         else None,
+                        _extract_write_result_paths_from_bytes(body)
+                        if settings.cache_template_write_result_paths
+                        else None,
                     )
-                    if settings.cache_template_artifact_ids
-                    or settings.cache_template_output_cap_paths
+                    if (
+                        settings.cache_template_artifact_ids
+                        or settings.cache_template_output_cap_paths
+                        or settings.cache_template_write_result_paths
+                    )
                     else upstream.content
                 ),
             },
@@ -1063,11 +1255,18 @@ async def _proxy_and_record_stream(
             await cm.__aexit__(None, None, None)
             if completed and 200 <= upstream.status_code < 300:
                 stream_body = b"".join(chunks)
-                if settings.cache_template_artifact_ids or settings.cache_template_output_cap_paths:
+                if (
+                    settings.cache_template_artifact_ids
+                    or settings.cache_template_output_cap_paths
+                    or settings.cache_template_write_result_paths
+                ):
                     stream_body = _template_response_bytes_for_cache(
                         stream_body,
                         _extract_output_cap_paths_from_bytes(body)
                         if settings.cache_template_output_cap_paths
+                        else None,
+                        _extract_write_result_paths_from_bytes(body)
+                        if settings.cache_template_write_result_paths
                         else None,
                     )
                 _write_record(
@@ -1107,6 +1306,11 @@ async def proxy(request: Request, path: str) -> Response:
         if settings.cache_template_output_cap_paths
         else []
     )
+    write_result_paths = (
+        _extract_write_result_paths_from_bytes(body)
+        if settings.cache_template_write_result_paths
+        else []
+    )
     cached = _read_record(key)
     if cached is not None:
         replayed = await _replay(
@@ -1114,6 +1318,7 @@ async def proxy(request: Request, path: str) -> Response:
             cache_marker="hit",
             artifact_id=artifact_id,
             output_cap_paths=output_cap_paths,
+            write_result_paths=write_result_paths,
         )
         if replayed is not None:
             return replayed
@@ -1130,6 +1335,7 @@ async def proxy(request: Request, path: str) -> Response:
                 cache_marker="hit",
                 artifact_id=artifact_id,
                 output_cap_paths=output_cap_paths,
+                write_result_paths=write_result_paths,
             )
             if replayed is not None:
                 return replayed
