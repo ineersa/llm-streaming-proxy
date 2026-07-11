@@ -70,6 +70,7 @@ If `LLAMA_PROXY_ADMIN_TOKEN` is set, cache admin endpoints require:
 | `LLAMA_PROXY_CACHE_TEMPLATE_ARTIFACT_IDS` | `true` | when enabled, normalize `agent_[0-9a-f]{16}` ids in cache keys and cassettes (see below); set `false` to store/replay raw ids |
 | `LLAMA_PROXY_CACHE_TEMPLATE_OUTPUT_CAP_PATHS` | `true` | when enabled, normalize Hatfield output-cap `Saved full output:` paths in cache keys and cassettes (see below); set `false` for raw paths |
 | `LLAMA_PROXY_CACHE_TEMPLATE_WRITE_RESULT_PATHS` | `true` | when enabled, normalize Hatfield write-tool `Successfully wrote <n> bytes to <path>` paths in cache keys and cassettes (see below); set `false` for raw paths |
+| `LLAMA_PROXY_CACHE_TEMPLATE_VIEW_IMAGE_PATHS` | `true` | when enabled, normalize Hatfield `view_image` tool-result paths in cache keys and cassettes (see below); set `false` for raw paths |
 
 ## Cache key
 
@@ -132,6 +133,19 @@ When `LLAMA_PROXY_CACHE_TEMPLATE_WRITE_RESULT_PATHS` is enabled (default), paths
 Upstream requests on a cache miss still use the **full original** body. Clear the cache after changing this setting.
 
 Ephemeral check (not pytest): `scripts/write_result_smoke.py`.
+
+### View-image tool-result paths
+
+When `LLAMA_PROXY_CACHE_TEMPLATE_VIEW_IMAGE_PATHS` is enabled (default), paths from Hatfield `view_image` tool results are treated as volatile:
+
+- **Extraction:** scan JSON string values line by line. For each line whose first JSON object has `type: "view_image"`, capture top-level `path` then each `attachment_refs[].path` (trimmed), in first-appearance order with deduplication. Also capture paths from `[Tool result image: <path> (` lines in the same strings. Generic JSON `path` fields without a `view_image` object are not normalized.
+- **Cache key:** after prior normalization steps, replace every exact occurrence of each extracted path in JSON string values with indexed placeholders `{{view_image_path_0}}`, `{{view_image_path_1}}`, …
+- **Record:** successful responses are stored with those paths templated (JSON bodies, tool-call `arguments`, and streaming SSE via assembled tool-argument buffers plus a final pass over the SSE bytes).
+- **Replay:** placeholders are replaced with the current request’s extracted paths in order. If substitution cannot be satisfied, the cassette is treated as unusable and the proxy falls through to an upstream miss.
+
+Upstream requests on a cache miss still use the **full original** body. Clear the cache after changing this setting.
+
+Ephemeral check (not pytest): `scripts/view_image_smoke.py`.
 
 ## systemd
 

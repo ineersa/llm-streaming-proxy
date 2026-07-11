@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Contract smoke for Hatfield write-tool success path templating (not pytest)."""
+"""Contract smoke for Hatfield view_image tool-result path templating (not pytest)."""
 from __future__ import annotations
 
 import importlib
@@ -31,70 +31,70 @@ def _load_app_module():
     return importlib.reload(app_module)
 
 
+def _tool_content(path: str) -> str:
+    obj = {
+        "type": "view_image",
+        "path": path,
+        "attachment_refs": [{"type": "image_ref", "path": path}],
+    }
+    return json.dumps(obj, separators=(",", ":")) + f"\n[Tool result image: {path} (image/jpeg)]"
+
+
 def test_helpers() -> None:
     app = _load_app_module()
-    path1 = "/var/tmp/hatfield-write-aaa/.hatfield/tmp/out/file1.txt"
-    path2 = "/var/tmp/hatfield-write-bbb/.hatfield/tmp/out/file2.txt"
-    line1 = f"Successfully wrote 42 bytes to {path1}"
-    line2 = f"Successfully wrote 42 bytes to {path2}"
-    text = f"tool ok\n{line1}\nmore\n{line2}"
+    path1 = "/absolute/random/test-a.jpeg"
+    path2 = "/absolute/random/test-b.jpeg"
+    text1 = _tool_content(path1)
+    text2 = _tool_content(path2)
 
-    paths = app._extract_write_result_paths_from_text(text)
-    assert paths == [path1, path2], paths
+    paths1 = app._extract_view_image_paths_from_text(text1)
+    assert paths1 == [path1], paths1
 
-    templated = app._apply_write_result_path_placeholders_to_string(text, paths)
-    assert "{{write_result_path_0}}" in templated and "{{write_result_path_1}}" in templated
-    assert path1 not in templated and path2 not in templated
+    templated = app._apply_view_image_path_placeholders_to_string(text1, paths1)
+    assert path1 not in templated
+    assert "{{view_image_path_0}}" in templated
+    assert templated.count("{{view_image_path_0}}") >= 2
 
-    assert app._extract_write_result_paths_from_text("no write marker") == []
-    assert app._extract_write_result_paths_from_text("Wrote 1 bytes to /tmp/x") == []
+    assert app._extract_view_image_paths_from_text('{"type":"other","path":"/x"}') == []
+    assert app._extract_view_image_paths_from_text("plain /etc/hosts") == []
 
-    body1 = {
-        "model": "m",
-        "messages": [{"role": "tool", "content": line1}],
-    }
-    body2 = {
-        "model": "m",
-        "messages": [{"role": "tool", "content": line2}],
-    }
+    body1 = {"model": "m", "messages": [{"role": "tool", "content": text1}]}
+    body2 = {"model": "m", "messages": [{"role": "tool", "content": text2}]}
     k1, _ = app._cache_key("POST", "/v1/chat/completions", "", json.dumps(body1).encode())
     k2, _ = app._cache_key("POST", "/v1/chat/completions", "", json.dumps(body2).encode())
     assert k1 == k2, (k1, k2)
 
-    other = {
-        "model": "m",
-        "messages": [{"role": "user", "content": "read /etc/hosts please"}],
-    }
+    other = {"model": "m", "messages": [{"role": "user", "content": "open /etc/hosts"}]}
     ko1, _ = app._cache_key("POST", "/v1/chat/completions", "", json.dumps(other).encode())
     ko2, _ = app._cache_key(
         "POST",
         "/v1/chat/completions",
         "",
-        json.dumps(
-            {
-                "model": "m",
-                "messages": [{"role": "user", "content": "read /etc/passwd please"}],
-            }
-        ).encode(),
+        json.dumps({"model": "m", "messages": [{"role": "user", "content": "open /etc/passwd"}]}).encode(),
     )
     assert ko1 != ko2
 
-    stored = json.dumps({"content": line1}).encode()
+    stored = json.dumps({"content": text1}).encode()
     templ = app._template_response_bytes_for_cache(
-        stored, output_cap_paths=None, write_result_paths=[path1]
+        stored,
+        output_cap_paths=None,
+        write_result_paths=None,
+        view_image_paths=[path1],
     )
-    assert b"{{write_result_path_0}}" in templ
+    assert b"{{view_image_path_0}}" in templ
+    assert path1.encode() not in templ
+
     replay = app._substitute_cached_response_bytes(
         templ,
         artifact_id=None,
         output_cap_paths=[],
-        write_result_paths=[path2],
-        view_image_paths=[],
+        write_result_paths=[],
+        view_image_paths=[path2],
     )
     assert replay is not None and path2.encode() in replay and path1.encode() not in replay
 
     missing = app._substitute_cached_response_bytes(
-        b"{{write_result_path_0}}",
+        b"{{view_image_path_0}}",
         artifact_id=None,
         output_cap_paths=[],
         write_result_paths=[],
@@ -103,7 +103,7 @@ def test_helpers() -> None:
     assert missing is None
 
     sse_path = path1
-    msg = line1
+    msg = text1
     half = len(msg) // 2
     part1 = json.dumps(
         {
@@ -115,7 +115,7 @@ def test_helpers() -> None:
                             {
                                 "index": 0,
                                 "function": {
-                                    "name": "write",
+                                    "name": "view",
                                     "arguments": '{"note":"' + msg[:half],
                                 },
                             }
@@ -146,38 +146,36 @@ def test_helpers() -> None:
     )
     sse = f"data: {part1}\n\ndata: {part2}\n\ndata: [DONE]\n\n".encode()
     templ_sse = app._template_response_bytes_for_cache(
-        sse, output_cap_paths=None, write_result_paths=[sse_path]
+        sse,
+        output_cap_paths=None,
+        write_result_paths=None,
+        view_image_paths=[sse_path],
     )
-    assert b"{{write_result_path_0}}" in templ_sse
+    assert b"{{view_image_path_0}}" in templ_sse
     replay_sse = app._substitute_cached_response_bytes(
         templ_sse,
         artifact_id=None,
         output_cap_paths=[],
-        write_result_paths=[path2],
-        view_image_paths=[],
+        write_result_paths=[],
+        view_image_paths=[path2],
     )
     assert replay_sse is not None and path2.encode() in replay_sse
 
-    os.environ["LLAMA_PROXY_CACHE_TEMPLATE_WRITE_RESULT_PATHS"] = "false"
+    os.environ["LLAMA_PROXY_CACHE_TEMPLATE_VIEW_IMAGE_PATHS"] = "false"
     app_off = importlib.reload(_load_app_module())
-    k_off1, _ = app_off._cache_key(
-        "POST", "/v1/chat/completions", "", json.dumps(body1).encode()
-    )
-    k_off2, _ = app_off._cache_key(
-        "POST", "/v1/chat/completions", "", json.dumps(body2).encode()
-    )
+    k_off1, _ = app_off._cache_key("POST", "/v1/chat/completions", "", json.dumps(body1).encode())
+    k_off2, _ = app_off._cache_key("POST", "/v1/chat/completions", "", json.dumps(body2).encode())
     assert k_off1 != k_off2
-    os.environ.pop("LLAMA_PROXY_CACHE_TEMPLATE_WRITE_RESULT_PATHS", None)
+    os.environ.pop("LLAMA_PROXY_CACHE_TEMPLATE_VIEW_IMAGE_PATHS", None)
     importlib.reload(_load_app_module())
 
 
 def test_proxy_integration() -> None:
-    path1 = "/var/tmp/hatfield-int-a/.hatfield/tmp/out/w1.txt"
-    path2 = "/var/tmp/hatfield-int-b/.hatfield/tmp/out/w2.txt"
-    cache_dir = tempfile.mkdtemp(prefix="llama-proxy-write-")
+    path1 = "/var/tmp/hatfield-view-a/test.jpeg"
+    path2 = "/var/tmp/hatfield-view-b/test.jpeg"
+    cache_dir = tempfile.mkdtemp(prefix="llama-proxy-view-")
     fake_port = _free_port()
     proxy_port = _free_port()
-    upstream_seen: list[str] = []
 
     fake_code = f"""
 import json
@@ -189,12 +187,15 @@ class H(BaseHTTPRequestHandler):
         text = body["messages"][0]["content"]
         path = ""
         for line in text.splitlines():
-            if " bytes to " in line and line.startswith("Successfully wrote "):
-                path = line.split(" bytes to ", 1)[1].strip()
-                break
+            if line.strip().startswith("{{"):
+                try:
+                    obj = json.loads(line)
+                    if obj.get("type") == "view_image":
+                        path = obj.get("path", "")
+                except json.JSONDecodeError:
+                    pass
         print("UPSTREAM_PATH", path, flush=True)
-        content = "Successfully wrote 1 bytes to " + path
-        resp = {{"choices":[{{"message":{{"content": content}}}}]}}
+        resp = {{"choices":[{{"message":{{"content": "ok " + path}}}}]}}
         data = json.dumps(resp).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
@@ -216,9 +217,10 @@ HTTPServer(("127.0.0.1", {fake_port}), H).serve_forever()
         "LLAMA_PROXY_PORT": str(proxy_port),
         "LLAMA_PROXY_HOST": "127.0.0.1",
         "LLAMA_PROXY_CACHE_DIR": cache_dir,
-        "LLAMA_PROXY_CACHE_TEMPLATE_WRITE_RESULT_PATHS": "true",
+        "LLAMA_PROXY_CACHE_TEMPLATE_VIEW_IMAGE_PATHS": "true",
         "LLAMA_PROXY_CACHE_TEMPLATE_ARTIFACT_IDS": "false",
         "LLAMA_PROXY_CACHE_TEMPLATE_OUTPUT_CAP_PATHS": "false",
+        "LLAMA_PROXY_CACHE_TEMPLATE_WRITE_RESULT_PATHS": "false",
     }
     proxy_proc = subprocess.Popen(
         [str(PYTHON), "-m", "llama_proxy"],
@@ -240,12 +242,7 @@ HTTPServer(("127.0.0.1", {fake_port}), H).serve_forever()
         def post(path: str) -> tuple[str | None, str]:
             body = {
                 "model": "m",
-                "messages": [
-                    {
-                        "role": "tool",
-                        "content": f"Successfully wrote 12 bytes to {path}",
-                    }
-                ],
+                "messages": [{"role": "tool", "content": _tool_content(path)}],
             }
             with httpx.Client(timeout=30.0) as client:
                 r = client.post(
@@ -259,7 +256,6 @@ HTTPServer(("127.0.0.1", {fake_port}), H).serve_forever()
         if fake_proc.stdout:
             line = fake_proc.stdout.readline()
             assert path1 in line, line
-            upstream_seen.append(path1)
 
         h2, t2 = post(path2)
         assert h2 == "hit", h2
@@ -274,7 +270,7 @@ HTTPServer(("127.0.0.1", {fake_port}), H).serve_forever()
 def main() -> None:
     test_helpers()
     test_proxy_integration()
-    print("write_result_smoke_ok")
+    print("view_image_smoke_ok")
 
 
 if __name__ == "__main__":

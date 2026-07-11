@@ -88,12 +88,20 @@ def test_helpers() -> None:
     templ = app._template_response_bytes_for_cache(stored, output_cap_paths=[path1])
     assert b"{{output_cap_path_0}}" in templ
     replay = app._substitute_cached_response_bytes(
-        templ, artifact_id=None, output_cap_paths=[path2], write_result_paths=[]
+        templ,
+        artifact_id=None,
+        output_cap_paths=[path2],
+        write_result_paths=[],
+        view_image_paths=[],
     )
     assert replay is not None and path2.encode() in replay and path1.encode() not in replay
 
     missing = app._substitute_cached_response_bytes(
-        b"{{output_cap_path_0}}", artifact_id=None, output_cap_paths=[], write_result_paths=[]
+        b"{{output_cap_path_0}}",
+        artifact_id=None,
+        output_cap_paths=[],
+        write_result_paths=[],
+        view_image_paths=[],
     )
     assert missing is None
 
@@ -141,7 +149,11 @@ def test_helpers() -> None:
     templ_sse = app._template_response_bytes_for_cache(sse, output_cap_paths=[sse_path])
     assert b"{{output_cap_path_0}}" in templ_sse
     replay_sse = app._substitute_cached_response_bytes(
-        templ_sse, artifact_id=None, output_cap_paths=[path2], write_result_paths=[]
+        templ_sse,
+        artifact_id=None,
+        output_cap_paths=[path2],
+        write_result_paths=[],
+        view_image_paths=[],
     )
     assert replay_sse is not None and path2.encode() in replay_sse
 

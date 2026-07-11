@@ -61,6 +61,8 @@ OUTPUT_CAP_SAVED_LINE_PREFIX = "Saved full output:"
 OUTPUT_CAP_PATH_PLACEHOLDER_RE = re.compile(r"\{\{output_cap_path_(\d+)\}\}")
 WRITE_RESULT_SUCCESS_RE = re.compile(r"Successfully wrote \d+ bytes to ([^\n]+)")
 WRITE_RESULT_PATH_PLACEHOLDER_RE = re.compile(r"\{\{write_result_path_(\d+)\}\}")
+TOOL_RESULT_IMAGE_PATH_RE = re.compile(r"\[Tool result image:\s*([^\s(]+)")
+VIEW_IMAGE_PATH_PLACEHOLDER_RE = re.compile(r"\{\{view_image_path_(\d+)\}\}")
 PARENT_RUN_ID_PLACEHOLDER = "{{parent_run_id}}"
 AGENT_RUN_ID_PLACEHOLDER = "{{agent_run_id}}"
 TEST_SUBAGENT_TMP_PLACEHOLDER = "{{test_subagent_tmp}}"
@@ -72,6 +74,10 @@ def _output_cap_path_placeholder(index: int) -> str:
 
 def _write_result_path_placeholder(index: int) -> str:
     return f"{{{{write_result_path_{index}}}}}"
+
+
+def _view_image_path_placeholder(index: int) -> str:
+    return f"{{{{view_image_path_{index}}}}}"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -96,6 +102,7 @@ class Settings:
     cache_template_artifact_ids: bool
     cache_template_output_cap_paths: bool
     cache_template_write_result_paths: bool
+    cache_template_view_image_paths: bool
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -125,6 +132,9 @@ class Settings:
             ),
             cache_template_write_result_paths=_env_bool(
                 "LLAMA_PROXY_CACHE_TEMPLATE_WRITE_RESULT_PATHS", True
+            ),
+            cache_template_view_image_paths=_env_bool(
+                "LLAMA_PROXY_CACHE_TEMPLATE_VIEW_IMAGE_PATHS", True
             ),
         )
 
@@ -393,6 +403,131 @@ def _substitute_write_result_placeholders_in_bytes(data: bytes, paths: list[str]
     )
 
 
+def _first_json_object_from_text(text: str) -> dict[str, Any] | None:
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    parsed = json.loads(text[start : i + 1])
+                except json.JSONDecodeError:
+                    return None
+                return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _append_view_image_paths_from_obj(obj: dict[str, Any], ordered: list[str], seen: set[str]) -> None:
+    if obj.get("type") != "view_image":
+        return
+    top = obj.get("path")
+    if isinstance(top, str):
+        p = top.strip()
+        if p and p not in seen:
+            seen.add(p)
+            ordered.append(p)
+    refs = obj.get("attachment_refs")
+    if isinstance(refs, list):
+        for ref in refs:
+            if not isinstance(ref, dict):
+                continue
+            rp = ref.get("path")
+            if isinstance(rp, str):
+                p = rp.strip()
+                if p and p not in seen:
+                    seen.add(p)
+                    ordered.append(p)
+
+
+def _extract_view_image_paths_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        obj = _first_json_object_from_text(line)
+        if obj is not None:
+            _append_view_image_paths_from_obj(obj, ordered, seen)
+    for match in TOOL_RESULT_IMAGE_PATH_RE.finditer(text):
+        p = match.group(1).strip()
+        if p and p not in seen:
+            seen.add(p)
+            ordered.append(p)
+    return ordered
+
+
+def _extract_view_image_paths_from_json(value: Any) -> list[str]:
+    strings: list[str] = []
+    _collect_strings(value, strings)
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for text in strings:
+        for path in _extract_view_image_paths_from_text(text):
+            if path not in seen:
+                seen.add(path)
+                ordered.append(path)
+    return ordered
+
+
+def _extract_view_image_paths_from_bytes(body: bytes) -> list[str]:
+    parsed = _safe_request_json(body)
+    if parsed is not None:
+        return _extract_view_image_paths_from_json(parsed)
+    if not body:
+        return []
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return []
+    return _extract_view_image_paths_from_text(text)
+
+
+def _apply_view_image_path_placeholders_to_string(text: str, paths: list[str]) -> str:
+    return _apply_indexed_path_placeholders_to_string(text, paths, _view_image_path_placeholder)
+
+
+def _template_view_image_paths_in_value(value: Any, paths: list[str]) -> Any:
+    return _template_indexed_paths_in_value(value, paths, _view_image_path_placeholder)
+
+
+def _template_view_image_paths_in_bytes(data: bytes, paths: list[str]) -> bytes:
+    return _template_indexed_paths_in_bytes(data, paths, _view_image_path_placeholder)
+
+
+def _substitute_view_image_placeholders_in_string(text: str, paths: list[str]) -> str | None:
+    return _substitute_indexed_placeholders_in_string(
+        text, paths, VIEW_IMAGE_PATH_PLACEHOLDER_RE, _view_image_path_placeholder
+    )
+
+
+def _substitute_view_image_placeholders_in_bytes(data: bytes, paths: list[str]) -> bytes | None:
+    return _substitute_indexed_placeholders_in_bytes(
+        data, paths, VIEW_IMAGE_PATH_PLACEHOLDER_RE, _view_image_path_placeholder
+    )
+
+
 def _apply_indexed_path_placeholders_to_string(
     text: str,
     paths: list[str],
@@ -529,6 +664,7 @@ def _template_tool_call_arguments_string(
     arguments: str,
     output_cap_paths: list[str] | None = None,
     write_result_paths: list[str] | None = None,
+    view_image_paths: list[str] | None = None,
 ) -> str:
     if not arguments:
         return arguments
@@ -537,6 +673,8 @@ def _template_tool_call_arguments_string(
         templated = _apply_output_cap_path_placeholders_to_string(templated, output_cap_paths)
     if write_result_paths:
         templated = _apply_write_result_path_placeholders_to_string(templated, write_result_paths)
+    if view_image_paths:
+        templated = _apply_view_image_path_placeholders_to_string(templated, view_image_paths)
     return templated
 
 
@@ -544,12 +682,16 @@ def _template_tool_calls_in_json_value(
     value: Any,
     output_cap_paths: list[str] | None = None,
     write_result_paths: list[str] | None = None,
+    view_image_paths: list[str] | None = None,
 ) -> Any:
     cap_paths = output_cap_paths or []
     write_paths = write_result_paths or []
+    view_paths = view_image_paths or []
     if isinstance(value, dict):
         out = {
-            k: _template_tool_calls_in_json_value(v, output_cap_paths, write_result_paths)
+            k: _template_tool_calls_in_json_value(
+                v, output_cap_paths, write_result_paths, view_image_paths
+            )
             for k, v in value.items()
         }
         if "tool_calls" in out and isinstance(out["tool_calls"], list):
@@ -558,13 +700,13 @@ def _template_tool_calls_in_json_value(
                     fn = tc["function"]
                     if isinstance(fn.get("arguments"), str):
                         fn["arguments"] = _template_tool_call_arguments_string(
-                            fn["arguments"], cap_paths, write_paths
+                            fn["arguments"], cap_paths, write_paths, view_paths
                         )
         if "function_call" in out and isinstance(out["function_call"], dict):
             fc = out["function_call"]
             if isinstance(fc.get("arguments"), str):
                 fc["arguments"] = _template_tool_call_arguments_string(
-                    fc["arguments"], cap_paths, write_paths
+                    fc["arguments"], cap_paths, write_paths, view_paths
                 )
         if "delta" in out and isinstance(out["delta"], dict):
             delta = out["delta"]
@@ -574,18 +716,20 @@ def _template_tool_calls_in_json_value(
                         fn = tc["function"]
                         if isinstance(fn.get("arguments"), str):
                             fn["arguments"] = _template_tool_call_arguments_string(
-                                fn["arguments"], cap_paths
+                                fn["arguments"], cap_paths, write_paths, view_paths
                             )
             if isinstance(delta.get("function_call"), dict):
                 fc = delta["function_call"]
                 if isinstance(fc.get("arguments"), str):
                     fc["arguments"] = _template_tool_call_arguments_string(
-                        fc["arguments"], cap_paths, write_paths
+                        fc["arguments"], cap_paths, write_paths, view_paths
                     )
         return out
     if isinstance(value, list):
         return [
-            _template_tool_calls_in_json_value(item, output_cap_paths, write_result_paths)
+            _template_tool_calls_in_json_value(
+                item, output_cap_paths, write_result_paths, view_image_paths
+            )
             for item in value
         ]
     return value
@@ -681,6 +825,7 @@ def _template_agent_artifact_ids_in_sse_stream(
     data: bytes,
     output_cap_paths: list[str] | None = None,
     write_result_paths: list[str] | None = None,
+    view_image_paths: list[str] | None = None,
 ) -> bytes:
     if not data:
         return data
@@ -707,8 +852,9 @@ def _template_agent_artifact_ids_in_sse_stream(
 
     cap_paths = output_cap_paths or []
     write_paths = write_result_paths or []
+    view_paths = view_image_paths or []
     templated_buffers = {
-        key: _template_tool_call_arguments_string(args, cap_paths, write_paths)
+        key: _template_tool_call_arguments_string(args, cap_paths, write_paths, view_paths)
         for key, args in buffers.items()
     }
     if not templated_buffers:
@@ -717,6 +863,8 @@ def _template_agent_artifact_ids_in_sse_stream(
             fallback = _template_output_cap_paths_in_bytes(fallback, cap_paths)
         if write_paths:
             fallback = _template_write_result_paths_in_bytes(fallback, write_paths)
+        if view_paths:
+            fallback = _template_view_image_paths_in_bytes(fallback, view_paths)
         return fallback
 
     last_tool_event_index: dict[tuple[int, int], int] = {}
@@ -807,6 +955,8 @@ def _template_agent_artifact_ids_in_sse_stream(
         result = _template_output_cap_paths_in_bytes(result, cap_paths)
     if write_paths:
         result = _template_write_result_paths_in_bytes(result, write_paths)
+    if view_paths:
+        result = _template_view_image_paths_in_bytes(result, view_paths)
     return result
 
 
@@ -814,13 +964,17 @@ def _template_response_bytes_for_cache(
     data: bytes,
     output_cap_paths: list[str] | None = None,
     write_result_paths: list[str] | None = None,
+    view_image_paths: list[str] | None = None,
 ) -> bytes:
     cap_paths = output_cap_paths or []
     write_paths = write_result_paths or []
+    view_paths = view_image_paths or []
     if not data:
         return data
     if b"data:" in data and (b"tool_calls" in data or b"function_call" in data):
-        templated = _template_agent_artifact_ids_in_sse_stream(data, cap_paths, write_paths)
+        templated = _template_agent_artifact_ids_in_sse_stream(
+            data, cap_paths, write_paths, view_paths
+        )
         if (
             AGENT_ARTIFACT_PLACEHOLDER.encode("utf-8") in templated
             or templated != data
@@ -834,6 +988,12 @@ def _template_response_bytes_for_cache(
                     _write_result_path_placeholder(i).encode() in templated for i in range(len(write_paths))
                 )
             )
+            or (
+                view_paths
+                and any(
+                    _view_image_path_placeholder(i).encode() in templated for i in range(len(view_paths))
+                )
+            )
         ):
             return templated
     try:
@@ -844,21 +1004,29 @@ def _template_response_bytes_for_cache(
             out = _template_output_cap_paths_in_bytes(out, cap_paths)
         if write_paths:
             out = _template_write_result_paths_in_bytes(out, write_paths)
+        if view_paths:
+            out = _template_view_image_paths_in_bytes(out, view_paths)
         return out
     if isinstance(obj, dict) and "choices" in obj:
-        templated_obj = _template_tool_calls_in_json_value(obj, cap_paths, write_paths)
+        templated_obj = _template_tool_calls_in_json_value(
+            obj, cap_paths, write_paths, view_paths
+        )
         if settings.cache_template_artifact_ids:
             templated_obj = _template_agent_artifact_ids_in_value(templated_obj)
         if cap_paths:
             templated_obj = _template_output_cap_paths_in_value(templated_obj, cap_paths)
         if write_paths:
             templated_obj = _template_write_result_paths_in_value(templated_obj, write_paths)
+        if view_paths:
+            templated_obj = _template_view_image_paths_in_value(templated_obj, view_paths)
         return _json_dumps(templated_obj).encode("utf-8")
     out = _template_agent_artifact_ids_in_bytes(data)
     if cap_paths:
         out = _template_output_cap_paths_in_bytes(out, cap_paths)
     if write_paths:
         out = _template_write_result_paths_in_bytes(out, write_paths)
+    if view_paths:
+        out = _template_view_image_paths_in_bytes(out, view_paths)
     return out
 
 
@@ -878,6 +1046,7 @@ def _substitute_cached_response_bytes(
     artifact_id: str | None,
     output_cap_paths: list[str],
     write_result_paths: list[str],
+    view_image_paths: list[str],
 ) -> bytes | None:
     if not data:
         return data
@@ -891,6 +1060,11 @@ def _substitute_cached_response_bytes(
         body = substituted
     if settings.cache_template_write_result_paths:
         substituted = _substitute_write_result_placeholders_in_bytes(body, write_result_paths)
+        if substituted is None:
+            return None
+        body = substituted
+    if settings.cache_template_view_image_paths:
+        substituted = _substitute_view_image_placeholders_in_bytes(body, view_image_paths)
         if substituted is None:
             return None
         body = substituted
@@ -908,6 +1082,9 @@ def _normalize_body_for_cache_key(body: Any) -> Any:
     if settings.cache_template_write_result_paths:
         write_paths = _extract_write_result_paths_from_json(body)
         body = _template_write_result_paths_in_value(body, write_paths)
+    if settings.cache_template_view_image_paths:
+        view_paths = _extract_view_image_paths_from_json(body)
+        body = _template_view_image_paths_in_value(body, view_paths)
     return body
 
 
@@ -1059,6 +1236,7 @@ async def health() -> dict[str, Any]:
         "cache_template_artifact_ids": settings.cache_template_artifact_ids,
         "cache_template_output_cap_paths": settings.cache_template_output_cap_paths,
         "cache_template_write_result_paths": settings.cache_template_write_result_paths,
+        "cache_template_view_image_paths": settings.cache_template_view_image_paths,
     }
 
 
@@ -1097,15 +1275,18 @@ async def _replay(
     artifact_id: str | None = None,
     output_cap_paths: list[str] | None = None,
     write_result_paths: list[str] | None = None,
+    view_image_paths: list[str] | None = None,
 ) -> Response | None:
     status_code = int(record.get("upstream", {}).get("status_code", 200))
     headers = _outbound_headers(record, cache_marker)
     cap_paths = output_cap_paths if output_cap_paths is not None else []
     write_paths = write_result_paths if write_result_paths is not None else []
+    view_paths = view_image_paths if view_image_paths is not None else []
     templating_enabled = (
         settings.cache_template_artifact_ids
         or settings.cache_template_output_cap_paths
         or settings.cache_template_write_result_paths
+        or settings.cache_template_view_image_paths
     )
 
     if record.get("stream"):
@@ -1116,6 +1297,7 @@ async def _replay(
                 artifact_id=artifact_id,
                 output_cap_paths=cap_paths,
                 write_result_paths=write_paths,
+                view_image_paths=view_paths,
             )
             if payload is None:
                 return None
@@ -1144,6 +1326,7 @@ async def _replay(
             artifact_id=artifact_id,
             output_cap_paths=cap_paths,
             write_result_paths=write_paths,
+            view_image_paths=view_paths,
         )
         if substituted is None:
             return None
@@ -1210,11 +1393,15 @@ async def _proxy_and_record_nonstream(
                         _extract_write_result_paths_from_bytes(body)
                         if settings.cache_template_write_result_paths
                         else None,
+                        _extract_view_image_paths_from_bytes(body)
+                        if settings.cache_template_view_image_paths
+                        else None,
                     )
                     if (
                         settings.cache_template_artifact_ids
                         or settings.cache_template_output_cap_paths
                         or settings.cache_template_write_result_paths
+                        or settings.cache_template_view_image_paths
                     )
                     else upstream.content
                 ),
@@ -1259,6 +1446,7 @@ async def _proxy_and_record_stream(
                     settings.cache_template_artifact_ids
                     or settings.cache_template_output_cap_paths
                     or settings.cache_template_write_result_paths
+                    or settings.cache_template_view_image_paths
                 ):
                     stream_body = _template_response_bytes_for_cache(
                         stream_body,
@@ -1267,6 +1455,9 @@ async def _proxy_and_record_stream(
                         else None,
                         _extract_write_result_paths_from_bytes(body)
                         if settings.cache_template_write_result_paths
+                        else None,
+                        _extract_view_image_paths_from_bytes(body)
+                        if settings.cache_template_view_image_paths
                         else None,
                     )
                 _write_record(
@@ -1311,6 +1502,11 @@ async def proxy(request: Request, path: str) -> Response:
         if settings.cache_template_write_result_paths
         else []
     )
+    view_image_paths = (
+        _extract_view_image_paths_from_bytes(body)
+        if settings.cache_template_view_image_paths
+        else []
+    )
     cached = _read_record(key)
     if cached is not None:
         replayed = await _replay(
@@ -1319,6 +1515,7 @@ async def proxy(request: Request, path: str) -> Response:
             artifact_id=artifact_id,
             output_cap_paths=output_cap_paths,
             write_result_paths=write_result_paths,
+            view_image_paths=view_image_paths,
         )
         if replayed is not None:
             return replayed
@@ -1336,6 +1533,7 @@ async def proxy(request: Request, path: str) -> Response:
                 artifact_id=artifact_id,
                 output_cap_paths=output_cap_paths,
                 write_result_paths=write_result_paths,
+                view_image_paths=view_image_paths,
             )
             if replayed is not None:
                 return replayed
